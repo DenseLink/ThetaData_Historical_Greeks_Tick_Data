@@ -1,0 +1,578 @@
+import requests
+import numpy as np
+import pandas as pd
+from datetime import time
+import datetime
+import os
+from functools import reduce
+from tqdm import tqdm
+from datetime import datetime
+from datetime import timedelta
+import json
+
+
+
+def fetch_contracts(root, date, contract_type):
+    """
+    Fetch contracts data for a given root symbol, date, and contract type,
+    and filter the results for the specified root symbol.
+    
+    :param root: Root symbol of the index, e.g., 'SPX' or 'SPXW'.
+    :param date: Date in 'YYYYMMDD' format.
+    :param contract_type: Type of contract data to fetch ('trade', 'quote', or 'open_interest').
+    :return: Filtered JSON response from the API for the specified root.
+    """
+    url = f"http://127.0.0.1:25510/v2/list/contracts/option/{contract_type}"
+    params = {"start_date": date}
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        # Filter the contracts for the specified root symbol
+        filtered_contracts = [contract for contract in data['response'] if contract[0] == root]
+        return {
+            "header": data["header"],
+            "response": filtered_contracts
+        }
+    else:
+        #print(f"Failed to fetch contracts for {contract_type}: {response.status_code}, {response.text}")
+        return None
+
+def log_strike_error_to_json(error_contracts_list, base_directory):
+    error_folder_name = "Strike_History_Errors"
+    error_log_filename = "errors_log.json"
+    
+    for contract in error_contracts_list:
+        root = contract["root"]
+        start_date = contract["start_date"]
+        error_folder_path = os.path.join(base_directory, root, error_folder_name, start_date)
+        error_log_file_path = os.path.join(error_folder_path, error_log_filename)
+
+        if not os.path.exists(error_folder_path):
+            os.makedirs(error_folder_path)
+
+        try:
+            if os.path.exists(error_log_file_path):
+                with open(error_log_file_path, "r") as file:
+                    existing_errors = json.load(file)
+            else:
+                existing_errors = []
+        except json.JSONDecodeError:
+            existing_errors = []
+
+        # Check for duplicates and append if no duplicates found
+        if contract not in existing_errors:
+            existing_errors.append(contract)
+            with open(error_log_file_path, "w") as file:
+                json.dump(existing_errors, file, indent=4)
+
+def log_strike_success_to_json(successful_contracts_list, base_directory):
+    success_folder_name = "Strike_History_Success"
+    success_log_filename = "Completed_log.json"
+    
+    for contract in successful_contracts_list:
+        root = contract["root"]
+        start_date = contract["start_date"]
+        success_folder_path = os.path.join(base_directory, root, success_folder_name, start_date)
+        success_log_file_path = os.path.join(success_folder_path, success_log_filename)
+
+        if not os.path.exists(success_folder_path):
+            os.makedirs(success_folder_path)
+
+        if os.path.exists(success_log_file_path):
+            with open(success_log_file_path, "r") as file:
+                existing_data = json.load(file)
+        else:
+            existing_data = []
+
+        if contract not in existing_data:
+            existing_data.append(contract)
+
+            with open(success_log_file_path, "w") as file:
+                json.dump(existing_data, file, indent=4)
+
+# Function to fetch data, convert to DataFrame, and apply 'ms_to_time'
+def fetch_and_format_data(endpoint, columns, root, expiration, strike, right, start_date, end_date):
+    interval = 10000
+    base_url = "http://127.0.0.1:25510/v2/hist/option/"
+    try:
+        response = requests.get(f"{base_url}{endpoint}", params={
+            "root": root, "exp": expiration, "strike": strike, "right": right,
+            "start_date": start_date, "end_date": end_date, "ivl": interval
+        })
+        response.raise_for_status()  # Ensure we notice bad responses
+
+        # Ensure there is data before attempting to decode JSON
+        if response.text:
+            data = response.json().get('response', [])
+            return pd.DataFrame(data, columns=columns).assign(time_of_day=lambda df: df['ms_of_day'].apply(ms_to_time))
+        else:
+            # Handle cases where there is no response data
+            error_contracts_list.append({
+                "root":root,
+                "expiration":expiration, 
+                "strike":strike, 
+                "right":right, 
+                "start_date":start_date, 
+                "end_date":end_date, 
+            })
+            return pd.DataFrame(columns=columns)
+    except (requests.exceptions.HTTPError, requests.exceptions.RequestException, ValueError) as e:
+        # Log the error and return an empty DataFrame
+        error_contracts_list.append({
+                "root":root,
+                "expiration":expiration, 
+                "strike":strike, 
+                "right":right, 
+                "start_date":start_date, 
+                "end_date":end_date, 
+            })
+        return pd.DataFrame(columns=columns)
+
+# Function to convert milliseconds to time of day
+def ms_to_time(ms):
+    seconds = (ms // 1000) % 60
+    minutes = (ms // (1000 * 60)) % 60
+    hours = (ms // (1000 * 60 * 60)) % 24
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def fetch_contracts_filtered_by_root(date, contract_type, url):
+    """
+    Fetch and filter contracts data for given date and contract type, filtering by root symbols.
+    """
+    params = {"start_date": date}
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        return data
+    else:
+        return []
+
+def collect_contracts_data(date, contract_types, url, url_1, url_2, roots,base_directory):
+    """
+    Check to see if location already exists:
+    """
+    _contract_list_folder = "CONTRACT_LIST"
+    _folder_path = os.path.join(base_directory, roots[0], _contract_list_folder,date)
+    if os.path.exists(_folder_path):
+        return
+    
+    """
+    Collect contracts data across specified roots and contract types into a list of dicts.
+    """
+    trade_contracts = fetch_contracts_filtered_by_root(date, contract_types[0], url)
+    quote_contracts = fetch_contracts_filtered_by_root(date, contract_types[1], url_1)
+    open_interest_contracts = fetch_contracts_filtered_by_root(date, contract_types[2], url_2)
+
+    # Initialize empty lists to ensure variables are defined
+    _trade_contracts = []
+    _quote_contracts = []
+    _open_interest_contracts = []
+    # Filter the contracts by the specified roots and ensure all dicts have the expected keys
+    if 'response' in trade_contracts:
+        #_trade_contracts = [{"contract_type": "trade", "date": date, **contract} for contract in trade_contracts['response']]
+        _trade_contracts = [{
+        "contract_type": "trade",
+        "date": date,
+        "root": contract[0],
+        "expiration": contract[1],
+        "strike": contract[2],
+        "right": contract[3]
+    } for contract in trade_contracts['response']]
+    if 'response' in quote_contracts:
+        #_quote_contracts = [{"contract_type": "quote", "date": date, **contract} for contract in quote_contracts['response']]
+        _quote_contracts = [{
+        "contract_type": "trade",
+        "date": date,
+        "root": contract[0],
+        "expiration": contract[1],
+        "strike": contract[2],
+        "right": contract[3]
+    } for contract in quote_contracts['response']]
+    if 'response' in open_interest_contracts:
+        #_open_interest_contracts = [{"contract_type": "open_interest", "date": date, **contract} for contract in open_interest_contracts['response']]
+        _open_interest_contracts = [{
+        "contract_type": "trade",
+        "date": date,
+        "root": contract[0],
+        "expiration": contract[1],
+        "strike": contract[2],
+        "right": contract[3]
+    } for contract in open_interest_contracts['response']]
+        
+    filtered_contracts = _trade_contracts+_quote_contracts+_open_interest_contracts
+    # Now, filtered_contracts contains dictionaries with a consistent set of keys
+    df = pd.DataFrame(filtered_contracts, columns=["root", "expiration", "strike", "right", "contract_type","date"])
+    df = df[df['root'].isin(roots)]
+    df = df.drop_duplicates(subset=['root', 'expiration', 'strike'])
+    missing_roots = [root for root in roots if root not in df['root'].unique()]
+    if missing_roots:
+        return
+
+
+    contract_list_folder = "CONTRACT_LIST"
+ 
+    for root in roots:   
+        df_filtered = df[df['root'] == root]
+        # Folder path for the current root
+        folder_path = os.path.join(base_directory, root, contract_list_folder,date)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+        filename = f"{root}_{date}.json"
+        file_path = os.path.join(folder_path, filename)
+        df_filtered.to_json(file_path, orient='records', lines=True)
+    all_contracts = []   
+    for index, row in df.iterrows():
+        contract_dict = {
+            "root": row['root'],
+            "expiration": row['expiration'],
+            "strike": row['strike'],
+            "right": row['right'],
+            "contract_type": row['contract_type'],
+            "date": row['date']
+        }
+        all_contracts.append(contract_dict)
+            
+    return all_contracts
+
+
+# Function to check and drop identical columns
+def check_and_drop_identical_columns(df, potential_duplicates, suffix):
+    for duplicate_col in potential_duplicates:
+        # Remove the suffix to find the original column name
+        # Ensure to handle different suffix lengths accurately
+        #second_order_col=''
+        if suffix == '_greeks':
+            original_col = duplicate_col[:-7]  # '_greeks' has 7 characters
+            #print(potential_duplicates)
+            #print(original_col)
+            #print(duplicate_col)
+        elif suffix == '_greeks_second_order':
+            #print(duplicate_col[:-20])
+            original_col = duplicate_col[:-20] # '_greeks_second_order' has 20 characters
+            first_order_col = original_col+'_greeks'
+        elif suffix == '_greeks_third_order':
+            #print(duplicate_col[:-19])
+            original_col = duplicate_col[:-19] # '_greeks_third_order' has 19 characters
+            first_order_col = original_col+'_greeks'
+            second_order_col = original_col+'_greeks_second_order'
+            #print(first_order_col)
+            #print(second_order_col)
+        else:
+            original_col = duplicate_col
+        
+        # Check if the original column exists in the DataFrame
+        if original_col in df.columns:
+            # Check if the original column's data equals the duplicate column's data
+            if df[original_col].equals(df[duplicate_col]):
+                #print(original_col)
+                #print(duplicate_col)
+                #print('end')
+                # Drop the duplicate column if the data is identical
+                df.drop(columns=[duplicate_col], inplace=True)
+        if suffix == '_greeks_second_order' or suffix == '_greeks_third_order':
+            if first_order_col in df.columns:
+                if df[first_order_col].equals(df[duplicate_col]):
+                    df.drop(columns=[duplicate_col], inplace=True)
+        if suffix == '_greeks_third_order':
+            if second_order_col in df.columns:
+                #print(second_order_col)
+                if df[second_order_col].equals(df[duplicate_col]):
+                    df.drop(columns=[duplicate_col], inplace=True)
+        #print(df.columns)
+
+
+
+
+
+
+
+
+
+
+
+
+def process_contracts(root, expiration, strike, right, start_date, end_date, interval, base_directory):
+    # Assuming 'first_contract' is already defined as the first row of your initial DataFrame
+    # Base URL for API requests
+    base_url = "http://127.0.0.1:25510/v2/hist/option/"
+
+    # Columns for each DataFrame
+    columns_quote = ['ms_of_day', 'bid_size', 'bid_exchange', 'bid', 'bid_condition', 'ask_size', 'ask_exchange', 'ask', 'ask_condition', 'date']
+    columns_iv = ['ms_of_day', 'bid', 'bid_implied_vol', 'midpoint', 'mid_implied_vol', 'ask', 'ask_implied_vol', 'iv_error', 'ms_of_day2', 'underlying_price', 'date']
+    columns_greeks = ['ms_of_day', 'bid2', 'ask2', 'delta', 'theta', 'vega', 'rho', 'epsilon', 'lamba', 'implied_vol', 'iv_error2', 'ms_of_day22', 'underlying_price2', 'date']
+    columns_greeks_2nd_order = ['ms_of_day', 'bid3', 'ask3', 'gamma', 'vanna', 'charm', 'vomma', 'veta', 'implied_vol3', 'iv_error3', 'ms_of_day23', 'underlying_price3', 'date']
+    columns_greeks_3rd_order = ['ms_of_day', 'bid4', 'ask4', 'speed', 'zomma', 'color', 'ultima', 'implied_vol4', 'iv_error4', 'ms_of_day24', 'underlying_price4', 'date']
+
+
+    # Fetch and format data for each DataFrame
+    df1 = fetch_and_format_data("quote", columns_quote, root, expiration, strike, right, start_date, end_date)
+    df2 = fetch_and_format_data("implied_volatility", columns_iv, root, expiration, strike, right, start_date, end_date)
+    df3 = fetch_and_format_data("greeks", columns_greeks, root, expiration, strike, right, start_date, end_date)
+    df3.rename(columns={'time_of_day': 'time_of_day_x'}, inplace=True)
+    df4 = fetch_and_format_data("greeks_second_order", columns_greeks_2nd_order, root, expiration, strike, right, start_date, end_date)
+    df4.rename(columns={'time_of_day': 'time_of_day_y'}, inplace=True)
+    df5 = fetch_and_format_data("greeks_third_order", columns_greeks_3rd_order, root, expiration, strike, right, start_date, end_date)
+    df5.rename(columns={'time_of_day': 'time_of_day_z'}, inplace=True)
+
+    # List of all DataFrames to merge
+    dfs = [df2, df3, df4, df5]
+
+    # Merge all DataFrames on 'ms_of_day' and 'date' using functools.reduce
+    # Now merge them
+    merged_df = reduce(lambda left, right: pd.merge(left, right, on=['ms_of_day', 'date'], how='outer'), dfs)
+    # Define the columns you want to keep as per the IV_Greeks specification
+    iv_greeks_columns = [
+        'ms_of_day', 'time_of_day', 'bid', 'bid_implied_vol', 'midpoint', 'mid_implied_vol', 'ask', 'ask_implied_vol',
+        'iv_error', 'ms_of_day2', 'underlying_price', 'date', 'delta', 'theta', 'vega', 'rho', 'epsilon', 'lamba',
+        'implied_vol', 'gamma', 'vanna', 'charm', 'vomma', 'veta', 'speed', 'zomma', 'color', 'ultima'
+    ]
+
+    # Keep only the columns specified in iv_greeks_columns
+    final_df = merged_df[iv_greeks_columns]
+    quote_column_order = [
+        'ms_of_day', 'time_of_day', 'bid_size', 'bid_exchange', 'bid', 'bid_condition', 
+        'ask_size', 'ask_exchange', 'ask', 'ask_condition', 'date'
+    ]
+
+    # Reorder the columns in 'df_quote'
+    df_quote = df1[quote_column_order]
+     #The final DataFrame is ready; now save it to the appropriate JSON file
+    folder_path_iv = os.path.join(base_directory, root, 'IV_Greeks', start_date)
+    folder_path_quotes = os.path.join(base_directory, root, 'QUOTES', start_date)
+    if not os.path.exists(folder_path_iv):
+        os.makedirs(folder_path_iv, exist_ok=True)
+    if not os.path.exists(folder_path_quotes):
+        os.makedirs(folder_path_quotes, exist_ok=True)
+    
+    file_path_iv = os.path.join(folder_path_iv, f"{root}_{start_date}_{expiration}_{strike}_{right}.json")
+    file_path_quotes = os.path.join(folder_path_quotes, f"{root}_{start_date}_{expiration}_{strike}_{right}.json")
+
+    final_df.to_json(file_path_iv, orient='records', lines=True)
+    df_quote.to_json(file_path_quotes, orient='records', lines=True)
+
+    # Log success
+    successful_contracts_list.append({
+                "root":root,
+                "expiration":expiration, 
+                "strike":strike, 
+                "right":right, 
+                "start_date":start_date, 
+                "end_date":end_date, 
+            })
+
+    
+def load_logged_contracts(folder_path, filename):
+    file_path = os.path.join(folder_path, filename)
+    if os.path.exists(file_path):
+        with open(file_path, "r") as file:
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                return []  # or handle the error as needed
+    return []    
+    
+def get_normalized_entry(entry, keys):
+    # Normalize the dictionary keys to lowercase
+    normalized_entry = {k.lower(): entry.get(k) or entry.get(k.capitalize()) for k in keys}
+    return tuple(normalized_entry[k] for k in keys)
+
+def begin_process(start_date,end_date,roots,date_list,contract_types,url,url_1,url_2,Trading_Days,base_directory,special_roots,_root1,_root2,_root3,_root4,_root4,interval,days_from_start_to_keep): 
+    for date in tqdm(date_list, desc="Total Contracts for Project Complete"):
+        contracts_data = collect_contracts_data(date, contract_types, url, url_1, url_2, Trading_Days,base_directory)
+    contract_list_folder = "CONTRACT_LIST"
+
+
+    #special_roots = {'SPXW', 'QQQ', 'SPY'} use this to generalize the code if you want to use a list. Be aware
+    #pandas can be particular about this.
+
+    for date in tqdm(date_list, desc="Total Project Complete"):    
+        daily_contracts = []  # Initialize the list for daily contracts
+        # Collect all file paths first
+        file_paths = [os.path.join(base_directory, root, contract_list_folder, date, f"{root}_{date}.json") for root in roots]
+        file_paths = [path for path in file_paths if os.path.exists(path)]
+        current_date = datetime.strptime(date, '%Y%m%d')
+        # Load dataframes if file exists
+        daily_contracts = [pd.read_json(path, lines=True) for path in file_paths]
+        # Concatenate all dataframes for the current day
+        if daily_contracts:
+            df = pd.concat(daily_contracts, ignore_index=True)      
+            filtered_dfs = []
+            for root in df['root'].unique():
+                root_df = df[df['root'] == root]  # Filter the DataFrame for the current root
+                if root in _root1:
+                    future_expirations = root_df[root_df['expiration'] >= int(current_date.strftime('%Y%m%d'))]['expiration'].unique()
+                    unique_expirations = sorted(future_expirations)[:days_from_start_to_keep]
+                    filtered_root_df = root_df[root_df['expiration'].isin(unique_expirations)]
+
+                elif root in _root2:
+                    future_expirations = root_df[root_df['expiration'] >= int(current_date.strftime('%Y%m%d'))]['expiration'].unique()
+                    unique_expirations = sorted(future_expirations)[:days_from_start_to_keep]
+                    filtered_root_df = root_df[root_df['expiration'].isin(unique_expirations)]
+
+                elif root in _root3:
+                    future_expirations = root_df[root_df['expiration'] >= int(current_date.strftime('%Y%m%d'))]['expiration'].unique()
+                    unique_expirations = sorted(future_expirations)[:days_from_start_to_keep]
+                    filtered_root_df = root_df[root_df['expiration'].isin(unique_expirations)]
+
+                elif root in _root4:
+                    future_expirations = root_df[root_df['expiration'] >= int(current_date.strftime('%Y%m%d'))]['expiration'].unique()
+                    unique_expirations = sorted(future_expirations)[:days_from_start_to_keep]
+                    filtered_root_df = root_df[root_df['expiration'].isin(unique_expirations)]
+                else:
+                    filtered_dfs.append(df[df['root'] == root])
+                filtered_dfs.append(filtered_root_df)
+            df = pd.concat(filtered_dfs).reset_index(drop=True)
+        else:
+            continue  # Skip to next date if no contracts
+
+        success_folder_name = "Strike_History_Success"
+        error_folder_name = "Strike_History_Errors"
+        conditional_descriptor = 'a'
+        successful_contracts_list = []
+        error_contracts_list = []
+        i = 1
+        tqdm_iterator = tqdm(df.iterrows(), desc="Processing contracts")
+        for index, contract in tqdm_iterator:
+            desc = f"Root: {contract['root']}, Strike: {contract['strike']}, Expiration: {contract['expiration']}, Right: {contract['right']}, Date: {contract['date']}, Contract:{i}"
+            tqdm_iterator.set_description(desc)
+            if conditional_descriptor != contract['root']:
+                i = 0
+                conditional_descriptor = contract['root']
+                log_strike_success_to_json(successful_contracts_list, base_directory)
+                log_strike_error_to_json(error_contracts_list, base_directory)
+                # After processing and logging for the current root
+                successful_contracts_list = []
+                error_contracts_list = []
+            i = i+1
+            # Define constants
+            root = str(contract['root'])
+            expiration = str(contract['expiration'])
+            strike = str(contract['strike'])
+            right = str(contract['right'])
+            start_date = str(contract['date'])  # Assuming 'date' is in 'YYYYMMDD' format
+            end_date = str(contract['date']) 
+            success_folder_path = os.path.join(base_directory, root, success_folder_name, start_date)
+            error_folder_path = os.path.join(base_directory, root, error_folder_name, start_date)
+            success_contracts = load_logged_contracts(success_folder_path, 'Completed_log.json')
+            error_contracts = load_logged_contracts(error_folder_path, 'errors_log.json')
+        
+            # Define a set or dictionary for quicker search
+            success_entries = {(entry["root"], entry["expiration"], entry["strike"], entry["right"], entry["start_date"], entry["end_date"]) for entry in success_contracts}
+            error_entries = {(entry["root"], entry["expiration"], entry["strike"], entry["right"], entry["start_date"], entry["end_date"]) for entry in error_contracts}        
+            contract_tuple = (root, expiration, strike, right, start_date, end_date)
+            if contract_tuple in success_entries or contract_tuple in error_entries:
+                continue
+            try:
+                process_contracts(root,  expiration, strike, right, start_date, end_dateinterval,base_directory)
+            except KeyError as e:
+                error_contracts_list.append({
+                    "root":root,
+                    "expiration":expiration, 
+                    "strike":strike, 
+                    "right":right, 
+                    "start_date":start_date, 
+                    "end_date":end_date, 
+                })
+    
+    
+def find_matching_contracts_and_log_success(roots, base_directory, date_list):
+    all_matching_files = []  # To store all matching filenames across roots and dates
+    all_contract_details = []
+    for root in roots:
+        for date in date_list:
+            quotes_dir = os.path.join(base_directory, root, 'QUOTES', date)
+            iv_greeks_dir = os.path.join(base_directory, root, 'IV_Greeks', date)
+            success_dir = os.path.join(base_directory, root, 'Strike_History_Success', date)
+
+            # Ensure directories exist
+            if not os.path.exists(quotes_dir) or not os.path.exists(iv_greeks_dir):
+                continue  # Skip to the next date if directories do not exist
+
+            # List all files in directories for the current date
+            quotes_files = set(os.listdir(quotes_dir))
+            iv_greeks_files = set(os.listdir(iv_greeks_dir))
+
+            # Find matching contract names
+            matching_files = quotes_files.intersection(iv_greeks_files)
+            all_matching_files.extend([(date, file) for file in matching_files])  # Store with date for reference
+
+            # Process matching filenames and prepare for JSON logging
+            for filename in matching_files:
+                # Extract information from filename
+                parts = filename.split('_')
+                if len(parts) == 5:  # Assuming filename format is root_start_date_expiration_strike_right.json
+                    contract_info = {
+                        "root": parts[0],
+                        "expiration": parts[2],
+                        "strike": parts[3],
+                        "right": parts[4].split('.')[0],  # Remove file extension
+                        "start_date": parts[1],
+                        "end_date":parts[1], 
+                    }
+                    # Here you can log to JSON or do further processing
+                    #print(contract_info)  # For demonstration
+                    all_contract_details.append(contract_info)
+    
+
+     # Group by root and start_date, then save
+    for contract_info in all_contract_details:
+        success_folder_path = os.path.join(base_directory, contract_info["root"], 'Strike_History_Success', contract_info["start_date"])
+        if not os.path.exists(success_folder_path):
+            os.makedirs(success_folder_path)
+
+        file_path = os.path.join(success_folder_path, 'Completed_log.json')
+        
+        # Check if the file exists and load existing data if it does
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as file:
+                data = json.load(file)
+        else:
+            data = []
+
+        # Add contract info if it's not already in the file
+        if contract_info not in data:
+            data.append(contract_info)
+            with open(file_path, 'w') as file:
+                json.dump(data, file, indent=4)
+    
+    return
+    
+    
+start_date = datetime.datetime(2024, 1, 1) #Format YYYY, MM, DD -> 2024, 1,1 -> 2024, 10, 11 No 0 in front of single digit
+end_date = datetime.datetime.now()
+roots = ["SPXW", "SPY", "UVXY","SPX","QQQ","VIX"] #These are contracts you're searching
+date_list = [(start_date + datetime.timedelta(days=x)).strftime('%Y%m%d') for x in range((end_date - start_date).days + 1)]#all dates within range
+contract_types = ["trade", "quote", "open_interest"] #use all to acquire all types of contracts. Or remove what is not needed
+url = f"http://127.0.0.1:25510/v2/list/contracts/option/trade"
+url_1 = f"http://127.0.0.1:25510/v2/list/contracts/option/quote"
+url_2 = f"http://127.0.0.1:25510/v2/list/contracts/option/open_interest"
+Trading_Days = ["SPXW", "SPY", "UVXY","SPX","QQQ","VIX","CAT","TSLA"] #Used to ensure that only contracts from trading days are captured. This means no weekend contracts or market holidays
+base_directory = "" #Where is all data saving
+special_roots = {'SPXW', 'QQQ', 'SPY'} #Can ignore unless you want to modify code to use a list in place of _root1 to 4
+_root1 = {''}#for a contract that you only want to capture certain date ranges with
+_root2 = {''}#for a contract that you only want to capture certain date ranges with
+_root3 = {''}#for a contract that you only want to capture certain date ranges with
+_root4 = {''}#for a contract that you only want to capture certain date ranges with. This one is special
+             #designed in case pandas is acting up and giving you same dates as another ticker like SPX and SPXW
+             #Currently set up to specifically exclude root3.
+             #If you have more than 4 tickers you want only certains days with the code block associated with these are 
+             #what you're going to want to generalize!
+contract_list_folder = "CONTRACT_LIST"
+interval = 9000 #Change for different intervals
+days_from_start_to_keep = 3 # this value will determine what contracts you want to keep. From start date this will capture all contracts that expire within 3 contracts. 
+                            # in other words. If I want an SPX contract from a thursday having this be a 3 will ensure I get
+                            # that thursday, that friday, and the following monday. This list is dependent on the how you handle
+                            #the trading days parameter which by default excludes weekends, and market holidays.
+begin_process(start_date,end_date,roots,date_list,contract_types,url,url_1,url_2,Trading_Days,base_directory,special_roots,
+             _root1,_root2,_root3,_root4,_root4,interval,days_from_start_to_keep) 
+    
+    
+
+
+
+
+#find_matching_contracts_and_log_success(roots, base_directory, date_list)
+#only run find_matching_contracts if your process was interrupted and you need to restart. This will
+#add success contracts so the process can resume where it left off 
+  
